@@ -1,64 +1,67 @@
 import { DurableObject } from "cloudflare:workers";
 
-/**
- * Welcome to Cloudflare Workers! This is your first Durable Objects application.
- *
- * - Run `npm run dev` in your terminal to start a development server
- * - Open a browser tab at http://localhost:8787/ to see your Durable Object in action
- * - Run `npm run deploy` to publish your application
- *
- * Bind resources to your worker in `wrangler.jsonc`. After adding bindings, a type definition for the
- * `Env` object can be regenerated with `npm run cf-typegen`.
- *
- * Learn more at https://developers.cloudflare.com/durable-objects
- */
+const RESET_INTERVAL_MS = 30 * 60 * 1000; // 30분
 
-/** A Durable Object's behavior is defined in an exported Javascript class */
 export class MyDurableObject extends DurableObject<Env> {
-	/**
-	 * The constructor is invoked once upon creation of the Durable Object, i.e. the first call to
-	 * 	`DurableObjectStub::get` for a given identifier (no-op constructors can be omitted)
-	 *
-	 * @param ctx - The interface for interacting with Durable Object state
-	 * @param env - The interface to reference bindings declared in wrangler.jsonc
-	 */
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
 	}
 
-	/**
-	 * The Durable Object exposes an RPC method sayHello which will be invoked when when a Durable
-	 *  Object instance receives a request from a Worker via the same method invocation on the stub
-	 *
-	 * @param name - The name provided to a Durable Object instance from a Worker
-	 * @returns The greeting to be sent back to the Worker
-	 */
-	async sayHello(name: string): Promise<string> {
-		return `Hello, ${name}!`;
+	async getCount(): Promise<{ count: number; lastResetTime: number }> {
+		const now = Date.now();
+		let lastResetTime = await this.ctx.storage.get<number>("lastResetTime");
+		
+		// 최초 요청이거나 30분이 지났으면 리셋
+		if (!lastResetTime || now - lastResetTime >= RESET_INTERVAL_MS) {
+			await this.ctx.storage.put("count", 0);
+			await this.ctx.storage.put("lastResetTime", now);
+			lastResetTime = now;
+		}
+		
+		let count = (await this.ctx.storage.get<number>("count")) || 0;
+		await this.ctx.storage.put("count", count + 1);
+		return { count, lastResetTime };
+	}
+
+	async resetCount(): Promise<void> {
+		await this.ctx.storage.put("count", 0);
+		await this.ctx.storage.put("lastResetTime", Date.now());
 	}
 }
 
 export default {
-	/**
-	 * This is the standard fetch handler for a Cloudflare Worker
-	 *
-	 * @param request - The request submitted to the Worker from the client
-	 * @param env - The interface to reference bindings declared in wrangler.jsonc
-	 * @param ctx - The execution context of the Worker
-	 * @returns The response to be sent back to the client
-	 */
 	async fetch(request, env, ctx): Promise<Response> {
-		// Create a stub to open a communication channel with the Durable Object
-		// instance named "foo".
-		//
-		// Requests from all Workers to the Durable Object instance named "foo"
-		// will go to a single remote Durable Object instance.
-		const stub = env.MY_DURABLE_OBJECT.getByName("foo");
+		const url = new URL(request.url);
+		const sabun = url.searchParams.get("sabun");
 
-		// Call the `sayHello()` RPC method on the stub to invoke the method on
-		// the remote Durable Object instance.
-		const greeting = await stub.sayHello("world");
+		if (!sabun) {
+			return new Response(JSON.stringify({ error: "sabun parameter is required" }), {
+				status: 400,
+				headers: { "Content-Type": "application/json" }
+			});
+		}
 
-		return new Response(greeting);
+		const stub = env.MY_DURABLE_OBJECT.getByName(sabun);
+
+		if (url.pathname === "/get_count" && request.method === "GET") {
+			const result = await stub.getCount();
+			return new Response(JSON.stringify({ 
+				sabun, 
+				count: result.count,
+				lastResetTime: new Date(result.lastResetTime).toISOString()
+			}), {
+				headers: { "Content-Type": "application/json" }
+			});
+		}
+
+		if (url.pathname === "/reset_count" && request.method === "PATCH") {
+			await stub.resetCount();
+			return new Response(JSON.stringify({ sabun, message: "Count reset to 0" }), {
+				headers: { "Content-Type": "application/json" }
+			});
+		}
+
+		return new Response("Not Found", { status: 404 });
 	},
 } satisfies ExportedHandler<Env>;
+
